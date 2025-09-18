@@ -171,6 +171,13 @@ impl<W: AsyncWriteExt> CollectiveSummary<W> {
 }
 
 async fn open_trace_file(path: impl AsRef<std::path::Path>) -> std::io::Result<tokio::fs::File> {
+    let path = path.as_ref();
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
     OpenOptions::new()
         .create(true)
         .write(true)
@@ -182,14 +189,19 @@ async fn open_trace_file(path: impl AsRef<std::path::Path>) -> std::io::Result<t
 async fn build_bufwriter(
     path: impl AsRef<std::path::Path>,
 ) -> Option<tokio::io::BufWriter<tokio::fs::File>> {
+    let path_ref = path.as_ref();
     let r = open_trace_file(&path).await;
     match r {
-        Ok(file) => Some(tokio::io::BufWriter::new(file)),
+        Ok(file) => {
+            log::debug!("Successfully opened file: {:?}", path_ref);
+            Some(tokio::io::BufWriter::new(file))
+        }
         Err(e) => {
             error!(
-                "Failed to open file {:?} for logging telemetry: {}.",
-                path.as_ref().as_os_str(),
-                e
+                "Failed to open file {:?} for logging telemetry: {}. Error kind: {:?}",
+                path_ref.as_os_str(),
+                e,
+                e.kind()
             );
             None
         }
@@ -200,8 +212,10 @@ async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
 ) -> std::io::Result<()> {
-    let mut latency_file = if let Some(template) = profiler.config.latency_file.as_ref() {
-        let path = template.replace("%p", &format!("{}", profiler.pid));
+    let latency_file_path = profiler.config.latency_file.as_ref()
+        .map(|template| template.replace("%p", &format!("{}", profiler.pid)));
+
+    let mut latency_file = if let Some(ref path) = latency_file_path {
         build_bufwriter(path).await
     } else {
         None
@@ -221,14 +235,31 @@ async fn exporter(
 
     let mut summary_interval = tokio::time::interval(profiler.config.summary_interval);
 
+    // Check if latency file still exists every 1 second
+    let mut file_check_interval = tokio::time::interval(Duration::from_secs(1));
+
     // the very first tick completes immediately
     summary_interval.tick().await;
+    file_check_interval.tick().await;
 
     loop {
         tokio::select! {
             maybe_telemetry = rx.recv() => {
                 match maybe_telemetry {
                     Some(telemetry) => {
+                        // Try to reopen file if it was None but config exists
+                        if latency_file.is_none() && latency_file_path.is_some() {
+                            if let Some(ref path) = latency_file_path {
+                                log::info!("Attempting to reopen latency file: {:?}", path);
+                                if let Some(new_file) = build_bufwriter(path).await {
+                                    log::info!("Successfully reopened latency file: {:?}", path);
+                                    latency_file = Some(new_file);
+                                } else {
+                                    log::warn!("Failed to reopen latency file: {:?}", path);
+                                }
+                            }
+                        }
+
                         if let Some(file) = latency_file.as_mut() {
                             let r = telemetry
                                 .write_to_file(
@@ -236,8 +267,29 @@ async fn exporter(
                                     |t| profiler.instant_to_timestamp(t).as_micros() as _)
                                 .await;
                             if let Err(e) = r {
-                                error!("Failed to log latency telemetry to file: {}. Stop logging.", e);
-                                latency_file = None;
+                                error!("Failed to log latency telemetry to file: {}. Attempting to reopen.", e);
+                                // Try to reopen the file
+                                if let Some(ref path) = latency_file_path {
+                                    if let Some(new_file) = build_bufwriter(path).await {
+                                        latency_file = Some(new_file);
+                                        // Retry writing to the reopened file
+                                        if let Some(file) = latency_file.as_mut() {
+                                            if let Err(e) = telemetry
+                                                .write_to_file(
+                                                    file,
+                                                    |t| profiler.instant_to_timestamp(t).as_micros() as _)
+                                                .await {
+                                                error!("Failed to write after reopening file: {}. Stopping logging.", e);
+                                                latency_file = None;
+                                            }
+                                        }
+                                    } else {
+                                        error!("Failed to reopen latency file. Stopping logging.");
+                                        latency_file = None;
+                                    }
+                                } else {
+                                    latency_file = None;
+                                }
                             }
                         }
 
@@ -264,6 +316,25 @@ async fn exporter(
                 if let Err(e) = r {
                     error!("Failed to log telemetry summary to file: {}. Stop logging.", e);
                     summary = None;
+                }
+            },
+            _ = file_check_interval.tick(), if latency_file.is_some() && latency_file_path.is_some() => {
+                // Check if latency file still exists on disk
+                if let Some(ref path) = latency_file_path {
+                    match tokio::fs::try_exists(path).await {
+                        Ok(exists) => {
+                            if !exists {
+                                log::warn!("Latency file {:?} has been deleted. Closing handle to force reopening.", path);
+                                // Force close the current handle so it will be reopened on next telemetry
+                                latency_file = None;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to check if latency file {:?} exists: {}. Assuming it was deleted.", path, e);
+                            // If we can't check, assume it's gone and close the handle
+                            latency_file = None;
+                        }
+                    }
                 }
             },
         }
