@@ -74,6 +74,7 @@ pub struct Config {
     pub latency_file: Option<String>,
     pub summary_file: Option<String>,
     pub summary_interval: Duration,
+    pub unix_socket_path: Option<String>,
 
     // Telemetry uploading config
     pub gpuviz_lib: String, // copybara:strip(gpuviz)
@@ -111,6 +112,7 @@ impl Config {
         field_from_env!(s, latency_file);
         field_from_env!(s, summary_file);
         field_from_env!(s, summary_interval, Duration::from_secs(60));
+        field_from_env!(s, unix_socket_path);
 
         // copybara:strip_begin(gpuviz)
         field_from_env!(s, gpuviz_lib, String::from(gpuviz::GPUVIZ_LIB_NAME));

@@ -24,6 +24,7 @@ use log::error;
 use serde_json::json;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -85,6 +86,70 @@ impl Telemetry {
             }
         }
         file.write_all(&buf).await
+    }
+}
+
+struct UnixSocketClient {
+    socket_path: String,
+    stream: Option<UnixStream>,
+    reconnect_attempts: u32,
+    max_reconnect_attempts: u32,
+}
+
+impl UnixSocketClient {
+    fn new(socket_path: String) -> Self {
+        Self {
+            socket_path,
+            stream: None,
+            reconnect_attempts: 0,
+            max_reconnect_attempts: 5,
+        }
+    }
+
+    async fn connect(&mut self) -> std::io::Result<()> {
+        match UnixStream::connect(&self.socket_path).await {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.reconnect_attempts = 0;
+                Ok(())
+            }
+            Err(e) => {
+                self.reconnect_attempts += 1;
+                Err(e)
+            }
+        }
+    }
+
+    async fn send(&mut self, data: &[u8]) -> std::io::Result<()> {
+        // Try to send, reconnecting if necessary
+        if self.stream.is_none() && self.reconnect_attempts < self.max_reconnect_attempts {
+            let _ = self.connect().await;
+        }
+
+        if let Some(ref mut stream) = self.stream {
+            // Send length prefix (4 bytes, big endian) followed by data
+            let len = data.len() as u32;
+            let len_bytes = len.to_be_bytes();
+
+            match stream.write_all(&len_bytes).await {
+                Ok(_) => match stream.write_all(data).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        self.stream = None;
+                        Err(e)
+                    }
+                },
+                Err(e) => {
+                    self.stream = None;
+                    Err(e)
+                }
+            }
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Failed to connect to Unix socket",
+            ))
+        }
     }
 }
 
@@ -219,6 +284,16 @@ async fn exporter(
         .clone()
         .map(gpuviz::HistogramManager::new);
 
+    let mut unix_socket = if let Some(socket_path) = profiler.config.unix_socket_path.as_ref() {
+        let path = socket_path.replace("%p", &format!("{}", profiler.pid));
+        let mut client = UnixSocketClient::new(path);
+        // Try initial connection but don't fail if it doesn't work
+        let _ = client.connect().await;
+        Some(client)
+    } else {
+        None
+    };
+
     let mut summary_interval = tokio::time::interval(profiler.config.summary_interval);
 
     // the very first tick completes immediately
@@ -252,6 +327,47 @@ async fn exporter(
                                 let _ = gpuviz.add_ncclop(op, |t| {
                                     profiler.instant_to_timestamp(*t).as_nanos() as _
                                 });
+                            }
+                        }
+
+                        // Send telemetry through Unix socket
+                        if let Some(socket) = unix_socket.as_mut() {
+                            // Serialize telemetry to JSON
+                            let json_data = match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    json!({
+                                        "type": "NcclOp",
+                                        "data": op.trace_record(|t| profiler.instant_to_timestamp(t).as_micros() as _),
+                                        "pid": profiler.pid,
+                                        "timestamp": profiler.instant_to_timestamp(Instant::now()).as_micros()
+                                    })
+                                }
+                                Telemetry::Group(group) => {
+                                    json!({
+                                        "type": "Group",
+                                        "data": group.trace_record(|t| profiler.instant_to_timestamp(t).as_micros() as _),
+                                        "pid": profiler.pid,
+                                        "timestamp": profiler.instant_to_timestamp(Instant::now()).as_micros()
+                                    })
+                                }
+                                Telemetry::ProxyOp(proxyop) => {
+                                    json!({
+                                        "type": "ProxyOp",
+                                        "data": proxyop.trace_record(|t| profiler.instant_to_timestamp(t).as_micros() as _),
+                                        "pid": profiler.pid,
+                                        "timestamp": profiler.instant_to_timestamp(Instant::now()).as_micros()
+                                    })
+                                }
+                            };
+
+                            if let Ok(json_bytes) = serde_json::to_vec(&json_data) {
+                                if let Err(e) = socket.send(&json_bytes).await {
+                                    // Log error but don't stop the exporter
+                                    if socket.reconnect_attempts >= socket.max_reconnect_attempts {
+                                        error!("Failed to send telemetry to Unix socket after {} attempts: {}. Disabling socket.", socket.max_reconnect_attempts, e);
+                                        unix_socket = None;
+                                    }
+                                }
                             }
                         }
                     },
